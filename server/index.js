@@ -96,7 +96,6 @@ mongoose.connection.on('reconnected', () => {
 });
 
 // Routes
-app.use('/api/blogs', require('./api/blogs'));
 app.use('/api/products', require('./api/products'));
 app.use('/api/enquiry', require('./api/enquiry'));
 
