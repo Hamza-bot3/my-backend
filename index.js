@@ -96,8 +96,8 @@ mongoose.connection.on('reconnected', () => {
 });
 
 // Routes
-app.use('/api/products', require('./api/products'));
-app.use('/api/enquiry', require('./api/enquiry'));
+app.use('/api/products', require('./server/api/products'));
+app.use('/api/enquiry', require('./server/api/enquiry'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
