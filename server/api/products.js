@@ -1,9 +1,8 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const router = express.Router();
+const { upload } = require('../../config/cloudinary');
 
 // Validation middleware
 const validateProduct = (req, res, next) => {
@@ -23,40 +22,6 @@ const validateProduct = (req, res, next) => {
   next();
 };
 
-// Configure multer for handling file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const uploadDir = path.join(__dirname, '../../public/uploads/products');
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: function (req, file, cb) {
-    // Generate a clean filename with timestamp and original extension
-    const timestamp = Date.now();
-    const ext = path.extname(file.originalname).toLowerCase();
-    const filename = `product-${timestamp}${ext}`;
-    cb(null, filename);
-  }
-});
-
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    // Accept only image files
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.'));
-    }
-  }
-});
-
 // Product Schema
 const productSchema = new mongoose.Schema({
   title: { type: String, required: true },
@@ -67,7 +32,10 @@ const productSchema = new mongoose.Schema({
   features: [String],
   specifications: [String],
   tags: [String],
-  images: [String],
+  images: [{
+    url: String,
+    public_id: String
+  }],
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
@@ -144,12 +112,14 @@ router.get('/', async (req, res) => {
 
 // Create a new product
 router.post('/', upload.array('images', 10), validateProduct, async (req, res) => {
-  let uploadedFiles = [];
   try {
     const { title, tagline, price, category, description, features, specifications, tags } = req.body;
-    uploadedFiles = req.files || [];
-    // Store just the filename in the database, not the full path
-    const images = uploadedFiles.map(file => file.filename);
+    
+    // Get the uploaded files from Cloudinary
+    const images = req.files ? req.files.map(file => ({
+      url: file.path,
+      public_id: file.filename
+    })) : [];
 
     const product = new Product({
       title,
@@ -157,38 +127,25 @@ router.post('/', upload.array('images', 10), validateProduct, async (req, res) =
       price: parseFloat(price),
       category,
       description,
-      features: features ? features.split(',').map(feature => feature.trim()) : [],
-      specifications: specifications ? specifications.split(',').map(spec => spec.trim()) : [],
-      tags: tags ? tags.split(',').map(tag => tag.trim()) : [],
+      features: features ? JSON.parse(features) : [],
+      specifications: specifications ? JSON.parse(specifications) : [],
+      tags: tags ? JSON.parse(tags) : [],
       images
     });
 
-    // Set timeout for database operation
-    const timeoutMs = 30000; // 30 seconds
-    const savedProduct = await Promise.race([
-      product.save(),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Database operation timed out')), timeoutMs)
-      )
-    ]);
-
-    res.status(201).json(savedProduct);
+    await product.save();
+    
+    res.status(201).json({
+      success: true,
+      message: 'Product created successfully',
+      data: product
+    });
   } catch (error) {
-    // Clean up uploaded files if save fails
-    for (const file of uploadedFiles) {
-      const filePath = path.join(__dirname, '../../public/uploads/products', file.filename);
-      try {
-        await fs.promises.unlink(filePath);
-      } catch (unlinkError) {
-        console.error('Error deleting file:', unlinkError);
-      }
-    }
-
-    console.error('Product creation error:', error);
-    const statusCode = error.message === 'Database operation timed out' ? 504 : 500;
-    res.status(statusCode).json({
-      message: error.message || 'Failed to create product',
-      error: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    console.error('Error creating product:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create product',
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
 });
@@ -212,15 +169,9 @@ router.delete('/:id', async (req, res) => {
     }
 
     // Delete associated images
-    for (const imagePath of product.images) {
-      const fullPath = path.join(__dirname, '../../public', imagePath);
-      try {
-        if (fs.existsSync(fullPath)) {
-          await fs.promises.unlink(fullPath);
-        }
-      } catch (unlinkError) {
-        console.error('Error deleting image file:', unlinkError);
-      }
+    for (const image of product.images) {
+      // Delete from Cloudinary
+      await upload.destroy(image.public_id);
     }
 
     await Product.findByIdAndDelete(req.params.id);
@@ -248,21 +199,42 @@ router.put('/:id', upload.array('images', 10), validateProduct, async (req, res)
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
-
-    // Handle new images - store just the filename
-    const newImages = req.files ? req.files.map(file => file.filename) : [];
-    const updatedImages = [...(product.images || []), ...newImages];
-
+    
+    // Update product fields
     product.title = title;
     product.tagline = tagline;
     product.price = parseFloat(price);
     product.category = category;
     product.description = description;
-    product.features = features ? features.split(',').map(feature => feature.trim()) : [];
-    product.specifications = specifications ? specifications.split(',').map(spec => spec.trim()) : [];
-    product.tags = tags ? tags.split(',').map(tag => tag.trim()) : [];
-    product.images = updatedImages;
+    product.features = features ? JSON.parse(features) : [];
+    product.specifications = specifications ? JSON.parse(specifications) : [];
+    product.tags = tags ? JSON.parse(tags) : [];
     product.updatedAt = Date.now();
+
+    // Update images
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        // Delete old image from Cloudinary
+        if (file.old_public_id) {
+          await upload.destroy(file.old_public_id);
+        }
+        
+        // Upload new image to Cloudinary
+        const result = await upload.upload(file.path);
+        
+        // Update image in the database
+        const image = product.images.find(i => i.public_id === file.old_public_id);
+        if (image) {
+          image.url = result.secure_url;
+          image.public_id = result.public_id;
+        } else {
+          product.images.push({
+            url: result.secure_url,
+            public_id: result.public_id
+          });
+        }
+      }
+    }
 
     const updatedProduct = await product.save();
     res.json(updatedProduct);
@@ -272,4 +244,4 @@ router.put('/:id', upload.array('images', 10), validateProduct, async (req, res)
   }
 });
 
-module.exports = router;
+module.exports = router

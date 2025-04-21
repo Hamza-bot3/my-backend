@@ -5,20 +5,20 @@ const path = require('path');
 const dotenv = require('dotenv');
 
 // Load environment variables from .env file
-dotenv.config({ path: path.join(__dirname, '.env') });
+dotenv.config({ path: path.join(__dirname, 'server/utils/.env') });
 
 const app = express();
 
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }))
 
-// Serve static files from the public directory with proper content-type handling
-app.use('/uploads', express.static(path.join(__dirname, '../public/uploads'), {
-  setHeaders: (res, path) => {
+// Serve static files from the uploads directory with proper content-type handling
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  setHeaders: (res, filePath) => {
     // Set proper content-type based on file extension
-    const ext = path.split('.').pop().toLowerCase();
+    const ext = filePath.split('.').pop().toLowerCase();
     const contentTypes = {
       'jpg': 'image/jpeg',
       'jpeg': 'image/jpeg',
@@ -29,8 +29,15 @@ app.use('/uploads', express.static(path.join(__dirname, '../public/uploads'), {
     if (contentTypes[ext]) {
       res.set('Content-Type', contentTypes[ext]);
     }
+    // Add cache control headers
+    res.set('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+    // Add CORS headers
+    res.set('Access-Control-Allow-Origin', '*');
   }
 }));
+
+// Also serve static files from the public directory
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Remove any existing Content-Security-Policy headers
 app.use((req, res, next) => {
@@ -96,8 +103,8 @@ mongoose.connection.on('reconnected', () => {
 });
 
 // Routes
-app.use('/api/products', require('./api/products'));
-app.use('/api/enquiry', require('./api/enquiry'));
+app.use('/api/products', require('./server/api/products'));
+app.use('/api/enquiry', require('./server/api/enquiry'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
