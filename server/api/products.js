@@ -2,7 +2,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const path = require('path');
 const router = express.Router();
-const { upload } = require('../../config/cloudinary');
+const { upload, cloudinary } = require('../../config/cloudinary');
 
 // Validation middleware
 const validateProduct = (req, res, next) => {
@@ -115,11 +115,20 @@ router.post('/', upload.array('images', 10), validateProduct, async (req, res) =
   try {
     const { title, tagline, price, category, description, features, specifications, tags } = req.body;
     
-    // Get the uploaded files from Cloudinary
-    const images = req.files ? req.files.map(file => ({
-      url: file.path,
-      public_id: file.filename
-    })) : [];
+    // Upload files to Cloudinary and get their URLs
+    const uploadPromises = req.files ? req.files.map(file => 
+      cloudinary.uploader.upload(file.path, {
+        folder: 'products',
+        resource_type: 'auto'
+      })
+    ) : [];
+
+    const uploadedImages = await Promise.all(uploadPromises);
+    
+    const images = uploadedImages.map(result => ({
+      url: result.secure_url,
+      public_id: result.public_id
+    }));
 
     const product = new Product({
       title,
@@ -141,11 +150,22 @@ router.post('/', upload.array('images', 10), validateProduct, async (req, res) =
       data: product
     });
   } catch (error) {
+    // If there's an error, try to delete any uploaded images
+    if (req.files) {
+      for (const file of req.files) {
+        try {
+          await cloudinary.uploader.destroy(file.filename);
+        } catch (deleteError) {
+          console.error('Error deleting uploaded image:', deleteError);
+        }
+      }
+    }
+
     console.error('Error creating product:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to create product',
-      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
+      error: error.message
     });
   }
 });
@@ -153,27 +173,23 @@ router.post('/', upload.array('images', 10), validateProduct, async (req, res) =
 // Delete a product
 router.delete('/:id', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid product ID format'
-      });
-    }
-
     const product = await Product.findById(req.params.id);
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: 'Product not found'
-      });
+      return res.status(404).json({ message: 'Product not found' });
     }
 
-    // Delete associated images
-    for (const image of product.images) {
-      // Delete from Cloudinary
-      await upload.destroy(image.public_id);
-    }
+    // Delete associated images from Cloudinary
+    const deletePromises = product.images.map(image => {
+      if (image.public_id) {
+        return cloudinary.uploader.destroy(image.public_id)
+          .catch(error => {
+            console.error(`Error deleting image ${image.public_id}:`, error);
+          });
+      }
+      return Promise.resolve();
+    });
 
+    await Promise.all(deletePromises);
     await Product.findByIdAndDelete(req.params.id);
 
     res.json({
@@ -185,7 +201,7 @@ router.delete('/:id', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to delete product',
-      error: process.env.NODE_ENV === 'development' ? error.message : 'An unexpected error occurred'
+      error: error.message
     });
   }
 });
@@ -193,14 +209,51 @@ router.delete('/:id', async (req, res) => {
 // Update a product
 router.put('/:id', upload.array('images', 10), validateProduct, async (req, res) => {
   try {
-    const { title, tagline, price, category, description, features, specifications, tags } = req.body;
     const product = await Product.findById(req.params.id);
-
     if (!product) {
       return res.status(404).json({ message: 'Product not found' });
     }
-    
-    // Update product fields
+
+    const { title, tagline, price, category, description, features, specifications, tags, deletedImages } = req.body;
+
+    // Delete images that were marked for deletion
+    if (deletedImages && Array.isArray(deletedImages)) {
+      const deletePromises = deletedImages.map(imageId => {
+        const image = product.images.find(img => img.public_id === imageId);
+        if (image) {
+          return cloudinary.uploader.destroy(image.public_id)
+            .then(() => {
+              product.images = product.images.filter(img => img.public_id !== imageId);
+            })
+            .catch(error => {
+              console.error(`Error deleting image ${imageId}:`, error);
+            });
+        }
+        return Promise.resolve();
+      });
+
+      await Promise.all(deletePromises);
+    }
+
+    // Upload and add new images
+    if (req.files && req.files.length > 0) {
+      const uploadPromises = req.files.map(file =>
+        cloudinary.uploader.upload(file.path, {
+          folder: 'products',
+          resource_type: 'auto'
+        })
+      );
+
+      const uploadedImages = await Promise.all(uploadPromises);
+      const newImages = uploadedImages.map(result => ({
+        url: result.secure_url,
+        public_id: result.public_id
+      }));
+
+      product.images.push(...newImages);
+    }
+
+    // Update other fields
     product.title = title;
     product.tagline = tagline;
     product.price = parseFloat(price);
@@ -211,36 +264,19 @@ router.put('/:id', upload.array('images', 10), validateProduct, async (req, res)
     product.tags = tags ? JSON.parse(tags) : [];
     product.updatedAt = Date.now();
 
-    // Update images
-    if (req.files && req.files.length > 0) {
-      for (const file of req.files) {
-        // Delete old image from Cloudinary
-        if (file.old_public_id) {
-          await upload.destroy(file.old_public_id);
-        }
-        
-        // Upload new image to Cloudinary
-        const result = await upload.upload(file.path);
-        
-        // Update image in the database
-        const image = product.images.find(i => i.public_id === file.old_public_id);
-        if (image) {
-          image.url = result.secure_url;
-          image.public_id = result.public_id;
-        } else {
-          product.images.push({
-            url: result.secure_url,
-            public_id: result.public_id
-          });
-        }
-      }
-    }
-
     const updatedProduct = await product.save();
-    res.json(updatedProduct);
+    res.json({
+      success: true,
+      message: 'Product updated successfully',
+      data: updatedProduct
+    });
   } catch (error) {
     console.error('Error updating product:', error);
-    res.status(500).json({ message: error.message || 'Failed to update product' });
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update product',
+      error: error.message
+    });
   }
 });
 
